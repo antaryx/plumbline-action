@@ -1,0 +1,138 @@
+name: "Run Plumbline Scanner"
+description: "Runs the Plumbline Linux hardening scanner and exports SARIF results."
+author: "Antaryx"
+
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  version:
+    description: >-
+      Plumbline release to download, as the release tag (for example v2.0.1).
+      A bare 2.0.1 is accepted and normalised.
+    required: false
+    default: "v2.0.1"
+  args:
+    description: >-
+      Arguments passed to the plumbline binary. --fail-on-critical takes a
+      count: `--fail-on-critical 1` fails the build on the first CRITICAL.
+    required: false
+    default: "scan --format=sarif --output=plumbline.sarif --fail-on-critical 1"
+  sudo:
+    description: >-
+      Run Plumbline with sudo, for full access to protected system paths.
+      Without it, every check that must read root-owned state reports UNKNOWN.
+      'true' or 'false'.
+    required: false
+    default: "false"
+  upload-sarif:
+    description: >-
+      Upload plumbline.sarif to the GitHub Security tab. The calling job needs
+      `permissions: security-events: write`. 'true' or 'false'.
+    required: false
+    default: "true"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Download and verify Plumbline
+      shell: bash
+      env:
+        PLUMBLINE_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        # The release path is the tag (v2.0.1); the asset inside it is named
+        # from the version with no leading "v" (plumbline_2.0.1_linux_amd64.tar.gz).
+        # Deriving both from one input is what keeps a caller from writing a
+        # version that 404s.
+        tag="$PLUMBLINE_VERSION"
+        case "$tag" in v*) ;; *) tag="v$tag" ;; esac
+        version="${tag#v}"
+
+        archive="plumbline_${version}_linux_amd64.tar.gz"
+        base="https://github.com/antaryx/plumbline/releases/download/${tag}"
+
+        # Downloaded and verified outside the workspace, so that checksums.txt
+        # never overwrites — or, on cleanup, deletes — a file of that name in
+        # the caller's checkout. Only the binary is moved in.
+        workdir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/plumbline.XXXXXX")"
+        trap 'rm -rf "$workdir"' EXIT
+
+        echo "Downloading ${base}/${archive}"
+        # --fail, so a 404 page is never unpacked as though it were a release.
+        curl --fail --silent --show-error --location \
+          --output "${workdir}/${archive}" "${base}/${archive}"
+        curl --fail --silent --show-error --location \
+          --output "${workdir}/checksums.txt" "${base}/checksums.txt"
+
+        # --ignore-missing, because checksums.txt covers every artifact in the
+        # release and only one of them was downloaded. sha256sum exits non-zero
+        # on a mismatch and also when it verified nothing at all, so a
+        # checksums.txt that does not name this archive fails here rather than
+        # passing silently. Nothing is extracted or executed before this.
+        echo "Verifying ${archive} against checksums.txt"
+        (cd "$workdir" && sha256sum --ignore-missing -c checksums.txt)
+
+        # Only the binary; the archive also carries the docs and licence.
+        tar -xzf "${workdir}/${archive}" -C "$workdir" plumbline
+        mv "${workdir}/plumbline" ./plumbline
+        chmod +x ./plumbline
+
+        # Prints the version, commit and catalog size the rest of this run is
+        # about, and fails here rather than mid-scan if the binary will not run.
+        ./plumbline version
+
+    - name: Run Plumbline
+      id: scan
+      shell: bash
+      env:
+        PLUMBLINE_ARGS: ${{ inputs.args }}
+        PLUMBLINE_SUDO: ${{ inputs.sudo }}
+      run: |
+        set -uo pipefail
+
+        # Unquoted on purpose: the input is a command line and has to split into
+        # words. It arrives through the environment rather than through ${{ }}
+        # interpolation so that nothing a caller writes is spliced into this
+        # script before bash sees it.
+        status=0
+        if [ "$PLUMBLINE_SUDO" = "true" ]; then
+          # -E keeps the runner's environment across the privilege change, so
+          # NO_COLOR, PLUMBLINE_NO_NOTICES and a TMPDIR set by an earlier step
+          # still reach the scanner.
+          sudo -E ./plumbline $PLUMBLINE_ARGS || status=$?
+        else
+          ./plumbline $PLUMBLINE_ARGS || status=$?
+        fi
+
+        # Plumbline writes --output owner-only, 0600, and re-applies that mode
+        # after opening. Under sudo the report is therefore root-owned and
+        # unreadable to the runner user the upload step runs as, so hand it back
+        # before anything tries to read it.
+        if [ "$PLUMBLINE_SUDO" = "true" ] && [ -f plumbline.sarif ]; then
+          sudo chown "$(id -u):$(id -g)" plumbline.sarif
+        fi
+
+        # Recorded before the exit code is propagated, so the upload step can
+        # tell "the scan failed the build" — a report exists and is exactly the
+        # one worth uploading — from "the scan never produced one".
+        if [ -f plumbline.sarif ]; then
+          echo "sarif=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "sarif=false" >> "$GITHUB_OUTPUT"
+        fi
+
+        exit "$status"
+
+    - name: Upload SARIF to the Security tab
+      # always(), because a scan that trips its gate exits non-zero, and that is
+      # precisely the run whose findings need to reach the Security tab. Guarded
+      # on the file existing so a usage error is reported as itself rather than
+      # as a missing-file failure from the upload.
+      if: always() && inputs.upload-sarif == 'true' && steps.scan.outputs.sarif == 'true'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: plumbline.sarif
+        category: plumbline
